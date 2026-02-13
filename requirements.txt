@@ -1,0 +1,14 @@
+# SILO - Spatial Iterative Latent Outset
+# Image Comparison Engine by Akbir Agarwal at Sylent.co
+
+# Core dependencies (required)
+numpy>=1.20.0
+opencv-python>=4.5.0
+
+# GPU acceleration (optional - install only if you have CUDA GPU)
+# Choose the version that matches your CUDA installation:
+# cupy-cuda12x  # For CUDA 12.x
+# cupy-cuda11x  # For CUDA 11.x
+
+# Visualization (optional - for --visual flag)
+matplotlib>=3.3.0
