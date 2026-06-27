@@ -42,8 +42,11 @@ from dataclasses import dataclass, field
 import numpy as np
 import cv2
 
-# Suppress warnings
-warnings.filterwarnings('ignore')
+# Suppress non-critical imaging warnings (e.g. EXIF, color-profile) while
+# preserving DeprecationWarning and SecurityWarning so they remain visible.
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+warnings.filterwarnings('ignore', message='.*iCCP.*')
+warnings.filterwarnings('ignore', message='.*EXIF.*')
 
 # =============================================================================
 # DEVICE SELECTION
@@ -698,7 +701,7 @@ class TransformDetector:
                     confidence = max(confidence, 0.6)
                 elif edge_increase > 0.1:
                     confidence = max(confidence, 0.4)
-        except:
+        except (cv2.error, ValueError, IndexError):
             pass
         
         # Method 2: Check for localized high-contrast regions (typical of watermarks)
@@ -734,7 +737,7 @@ class TransformDetector:
                     confidence = max(confidence, 0.7)
                 elif total_size > 0.01 * high_diff.size and total_size < 0.3 * high_diff.size:
                     confidence = max(confidence, 0.5)
-        except:
+        except (cv2.error, ValueError, IndexError):
             pass
         
         # Method 3: Check corner/edge regions for watermark placement
@@ -765,7 +768,7 @@ class TransformDetector:
             # But need significant difference
             if corner_change > 0.6 and corner_change > center_change * 1.5:
                 confidence = max(confidence, 0.65)
-        except:
+        except (cv2.error, ValueError, IndexError):
             pass
         
         # Higher threshold for watermark detection
@@ -1085,11 +1088,27 @@ class ImageMatcher:
         
         return result
     
+    _ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp', '.gif'}
+
     def _load_image(self, image: Union[str, np.ndarray]) -> Optional[np.ndarray]:
-        """Load image from path or array."""
+        """Load image from path or array.
+
+        Validates that the resolved path points to a regular file with a
+        supported image extension before reading.  This prevents path-traversal
+        and arbitrary-file-read when the library is used in a server context.
+        """
         try:
             if isinstance(image, str):
-                img = cv2.imread(str(image))
+                path = Path(image).resolve()
+                if not path.is_file():
+                    if self.config.verbose:
+                        print(f"Image not found: {image}")
+                    return None
+                if path.suffix.lower() not in self._ALLOWED_EXTENSIONS:
+                    if self.config.verbose:
+                        print(f"Unsupported image format: {path.suffix}")
+                    return None
+                img = cv2.imread(str(path))
                 if img is not None:
                     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 return None
