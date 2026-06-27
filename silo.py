@@ -32,6 +32,7 @@ Version: 2.0.0
 
 import sys
 import time
+import logging
 import warnings
 import argparse
 from enum import Enum, auto
@@ -49,6 +50,10 @@ from utils import to_grayscale, resize_to_max, resize_to_match, compute_pixel_di
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 warnings.filterwarnings('ignore', message='.*iCCP.*')
 warnings.filterwarnings('ignore', message='.*EXIF.*')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='skimage')
+warnings.filterwarnings('ignore', category=FutureWarning, module='numpy')
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # DEVICE SELECTION
@@ -101,7 +106,11 @@ def select_device(device: Device) -> Device:
         return Device.CPU
     
     if device == Device.GPU and not CUPY_AVAILABLE:
-        print("GPU requested but CuPy not available. Falling back to CPU.")
+        warnings.warn(
+            "GPU requested but CuPy not available. Falling back to CPU.",
+            RuntimeWarning,
+            stacklevel=2
+        )
         return Device.CPU
     
     return device
@@ -161,9 +170,10 @@ class MatchResult:
     # Debug info
     early_exit: bool = False
     exit_reason: str = ""
+    error: Optional[str] = None
     
     def to_dict(self) -> Dict:
-        return {
+        d = {
             'is_match': self.is_match,
             'similarity': round(self.similarity, 4),
             'confidence': round(self.confidence, 4),
@@ -176,6 +186,9 @@ class MatchResult:
             'feature_count': self.feature_count,
             'transforms': self.transforms.to_dict()
         }
+        if self.error is not None:
+            d['error'] = self.error
+        return d
     
     def __str__(self) -> str:
         status = "[MATCH]" if self.is_match else "[NO MATCH]"
@@ -382,7 +395,11 @@ class TemplateMatcher:
                 if max_val > 0.85:
                     break
             
-            except Exception:
+            except cv2.error as e:
+                logger.debug("Template matching failed at scale %.2f: %s", scale, e)
+                continue
+            except (ValueError, TypeError) as e:
+                logger.debug("Invalid dimensions at scale %.2f: %s", scale, e)
                 continue
         
         return best_corr
@@ -639,8 +656,8 @@ class TransformDetector:
                     confidence = max(confidence, 0.6)
                 elif edge_increase > 0.1:
                     confidence = max(confidence, 0.4)
-        except (cv2.error, ValueError, IndexError):
-            pass
+        except (cv2.error, ValueError, IndexError) as e:
+            logger.debug("Watermark edge detection failed: %s", e)
         
         # Method 2: Check for localized high-contrast regions (typical of watermarks)
         try:
@@ -662,8 +679,8 @@ class TransformDetector:
                     confidence = max(confidence, 0.7)
                 elif total_size > 0.01 * high_diff.size and total_size < 0.3 * high_diff.size:
                     confidence = max(confidence, 0.5)
-        except (cv2.error, ValueError, IndexError):
-            pass
+        except (cv2.error, ValueError, IndexError) as e:
+            logger.debug("Watermark connected-component analysis failed: %s", e)
         
         # Method 3: Check corner/edge regions for watermark placement
         try:
@@ -690,8 +707,8 @@ class TransformDetector:
             
             if corner_change > 0.6 and corner_change > center_change * 1.5:
                 confidence = max(confidence, 0.65)
-        except (cv2.error, ValueError, IndexError):
-            pass
+        except (cv2.error, ValueError, IndexError) as e:
+            logger.debug("Watermark corner analysis failed: %s", e)
         
         return confidence > 0.55, confidence
 
@@ -881,13 +898,21 @@ class ImageMatcher:
         result = MatchResult(device_used=self.config.device)
         
         # Load images
-        img1 = self._load_image(image1)
-        img2 = self._load_image(image2)
+        img1, err1 = self._load_image(image1)
+        img2, err2 = self._load_image(image2)
         
         if img1 is None or img2 is None:
+            errors = []
+            if err1:
+                errors.append(f"image1: {err1}")
+            if err2:
+                errors.append(f"image2: {err2}")
+            error_msg = "; ".join(errors) if errors else "Failed to load one or both images"
             result.is_match = False
             result.confidence = 0.0
             result.method = "error"
+            result.error = error_msg
+            logger.warning("Image comparison aborted: %s", error_msg)
             return result
         
         # Stage 1: Pixel Analysis
@@ -1006,39 +1031,42 @@ class ImageMatcher:
     
     _ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp', '.gif'}
 
-    def _load_image(self, image: Union[str, np.ndarray]) -> Optional[np.ndarray]:
+    def _load_image(self, image: Union[str, np.ndarray]) -> Tuple[Optional[np.ndarray], Optional[str]]:
         """Load image from path or array.
 
         Validates that the resolved path points to a regular file with a
         supported image extension before reading.  This prevents path-traversal
         and arbitrary-file-read when the library is used in a server context.
+        
+        Returns:
+            Tuple of (image_array, error_message). error_message is None on success.
         """
         try:
             if isinstance(image, str):
                 path = Path(image).resolve()
                 if not path.is_file():
-                    if self.config.verbose:
-                        print(f"Image not found: {image}")
-                    return None
+                    return None, f"File not found: {image}"
                 if path.suffix.lower() not in self._ALLOWED_EXTENSIONS:
-                    if self.config.verbose:
-                        print(f"Unsupported image format: {path.suffix}")
-                    return None
+                    return None, f"Unsupported image format: {path.suffix}"
                 img = cv2.imread(str(path))
-                if img is not None:
-                    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                return None
+                if img is None:
+                    return None, f"Failed to decode image (corrupt file): {image}"
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), None
             elif isinstance(image, np.ndarray):
+                if image.size == 0:
+                    return None, "Empty array provided"
                 if len(image.shape) == 2:
-                    return np.stack([image] * 3, axis=2)
-                elif image.shape[2] == 4:
-                    return image[:, :, :3]
-                return image
-            return None
+                    return np.stack([image] * 3, axis=2), None
+                elif len(image.shape) == 3 and image.shape[2] == 4:
+                    return image[:, :, :3], None
+                elif len(image.shape) == 3 and image.shape[2] == 3:
+                    return image, None
+                return None, f"Unsupported array shape: {image.shape}"
+            return None, f"Unsupported image type: {type(image).__name__}"
+        except (OSError, IOError) as e:
+            return None, f"I/O error reading image: {e}"
         except Exception as e:
-            if self.config.verbose:
-                print(f"Error loading image: {e}")
-            return None
+            return None, f"Unexpected error loading image: {e}"
 
 
 # =============================================================================
