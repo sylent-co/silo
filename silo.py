@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import cv2
 
+from utils import to_grayscale, resize_to_max, resize_to_match, compute_pixel_diff, compute_size_ratio
+
 # Suppress non-critical imaging warnings (e.g. EXIF, color-profile) while
 # preserving DeprecationWarning and SecurityWarning so they remain visible.
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -227,22 +229,22 @@ class PixelAnalyzer:
         orig_shape2 = img2.shape
         
         # Resize for speed (independently, not to same size)
-        img1_resized = self._resize(img1)
-        img2_resized = self._resize(img2)
+        img1_resized = resize_to_max(img1, self.config.max_image_size)
+        img2_resized = resize_to_max(img2, self.config.max_image_size)
         
         # For SSIM, need same size - create copies
         h, w = img1_resized.shape[:2]
-        img2_for_ssim = cv2.resize(img2_resized, (w, h), interpolation=cv2.INTER_AREA)
+        img2_for_ssim = resize_to_match(img2_resized, (h, w))
         
         # Convert to grayscale for SSIM
-        gray1 = cv2.cvtColor(img1_resized, cv2.COLOR_RGB2GRAY) if len(img1_resized.shape) == 3 else img1_resized
-        gray2_for_ssim = cv2.cvtColor(img2_for_ssim, cv2.COLOR_RGB2GRAY) if len(img2_for_ssim.shape) == 3 else img2_for_ssim
+        gray1 = to_grayscale(img1_resized)
+        gray2_for_ssim = to_grayscale(img2_for_ssim)
         
         # Calculate SSIM
         ssim_score = self._calculate_ssim(gray1, gray2_for_ssim)
         
         # Calculate pixel difference
-        pixel_diff, change_mask = self._calculate_pixel_diff(img1_resized, img2_for_ssim)
+        pixel_diff, change_mask = compute_pixel_diff(img1_resized, img2_for_ssim)
         
         return {
             'ssim_score': ssim_score,
@@ -257,17 +259,6 @@ class PixelAnalyzer:
             'time': time.time() - start_time
         }
     
-    def _resize(self, img: np.ndarray) -> np.ndarray:
-        """Resize image for faster processing."""
-        h, w = img.shape[:2]
-        max_size = self.config.max_image_size
-        
-        if max(h, w) > max_size:
-            scale = max_size / max(h, w)
-            new_h, new_w = int(h * scale), int(w * scale)
-            return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        return img
-    
     def _calculate_ssim(self, gray1: np.ndarray, gray2: np.ndarray) -> float:
         """Calculate SSIM between grayscale images."""
         if SKIMAGE_AVAILABLE:
@@ -278,20 +269,7 @@ class PixelAnalyzer:
         result = cv2.matchTemplate(gray1, gray2, cv2.TM_CCOEFF_NORMED)
         return float(result[0, 0])
     
-    def _calculate_pixel_diff(self, img1: np.ndarray, img2: np.ndarray) -> Tuple[float, np.ndarray]:
-        """Calculate pixel difference percentage."""
-        diff = np.abs(img1.astype(np.int32) - img2.astype(np.int32))
-        
-        if len(diff.shape) == 3:
-            diff_max = np.maximum(np.maximum(diff[:, :, 0], diff[:, :, 1]), diff[:, :, 2])
-        else:
-            diff_max = diff
-        
-        threshold = 15
-        change_mask = (diff_max >= threshold).astype(np.uint8)
-        pixel_diff = (np.sum(change_mask) / change_mask.size) * 100
-        
-        return pixel_diff, change_mask
+
 
 
 # =============================================================================
@@ -311,8 +289,8 @@ class TemplateMatcher:
         start_time = time.time()
         
         # Convert to grayscale
-        gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY) if len(img1.shape) == 3 else img1
-        gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY) if len(img2.shape) == 3 else img2
+        gray1 = to_grayscale(img1)
+        gray2 = to_grayscale(img2)
         
         # Determine which is larger (target) and smaller (template)
         area1 = gray1.shape[0] * gray1.shape[1]
@@ -326,16 +304,8 @@ class TemplateMatcher:
             larger_is_first = False
         
         # Resize for speed
-        max_large = 800
-        max_small = 400
-        
-        if max(larger.shape) > max_large:
-            scale = max_large / max(larger.shape)
-            larger = cv2.resize(larger, None, fx=scale, fy=scale)
-        
-        if max(smaller.shape) > max_small:
-            scale = max_small / max(smaller.shape)
-            smaller = cv2.resize(smaller, None, fx=scale, fy=scale)
+        larger = resize_to_max(larger, 800)
+        smaller = resize_to_max(smaller, 400)
         
         # Try all rotations
         results = []
@@ -435,8 +405,8 @@ class FeatureMatcher:
         start_time = time.time()
         
         # Convert to grayscale
-        gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY) if len(img1.shape) == 3 else img1
-        gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY) if len(img2.shape) == 3 else img2
+        gray1 = to_grayscale(img1)
+        gray2 = to_grayscale(img2)
         
         # Detect features
         kp1, des1 = self.detector.detectAndCompute(gray1, None)
@@ -516,11 +486,7 @@ class TransformDetector:
         info.is_rotated = best_angle != 0
         
         # Crop detection
-        orig_shape1 = pixel_result['orig_shape1']
-        orig_shape2 = pixel_result['orig_shape2']
-        area1 = orig_shape1[0] * orig_shape1[1]
-        area2 = orig_shape2[0] * orig_shape2[1]
-        size_ratio = min(area1, area2) / max(area1, area2)
+        size_ratio = compute_size_ratio(pixel_result['orig_shape1'], pixel_result['orig_shape2'])
         info.is_cropped = size_ratio < self.config.crop_size_ratio_threshold
         
         # Overlay detection (image on different background)
@@ -546,57 +512,39 @@ class TransformDetector:
         correlation = template_result['correlation']
         ssim = pixel_result['ssim_score']
         
-        # Overlays have:
-        # 1. Good template correlation (content matches)
-        # 2. Good feature matching (same content)
-        # 3. Different image dimensions (usually)
-        # 4. Large areas of completely different content (not just color shift)
-        
         if correlation < 0.5:
             return False
         
-        # High SSIM with high pixel diff usually indicates filter, not overlay
-        # Overlay would have lower SSIM because background is different
         if ssim > 0.7:
             return False
         
         # If feature matching is provided, check it
         if feature_result is not None:
-            feature_confidence = feature_result.get('confidence', 0)
             feature_matches = feature_result.get('matches', 0)
-            # If very few features match, it's not an overlay - it's a different image
+            feature_confidence = feature_result.get('confidence', 0)
             if feature_matches < 10 or feature_confidence < 0.1:
                 return False
         
         # Check for size difference (overlays often have different dimensions)
-        h1, w1 = img1.shape[:2]
-        h2, w2 = img2.shape[:2]
-        size_ratio = (h1 * w1) / (h2 * w2)
-        
-        # If sizes are very different, more likely to be overlay
-        has_size_diff = size_ratio < 0.7 or size_ratio > 1.4
+        size_ratio = compute_size_ratio(img1.shape, img2.shape)
+        has_size_diff = size_ratio < 0.7
         
         # Resize images to same size for comparison
+        h1, w1 = img1.shape[:2]
+        h2, w2 = img2.shape[:2]
         if h1 * w1 < h2 * w2:
-            img1 = cv2.resize(img1, (w2, h2))
+            img1 = resize_to_match(img1, (h2, w2))
         else:
-            img2 = cv2.resize(img2, (w1, h1))
+            img2 = resize_to_match(img2, (h1, w1))
         
         # Check for large uniform regions in the difference
-        diff = np.abs(img1.astype(np.int32) - img2.astype(np.int32))
-        if len(diff.shape) == 3:
-            diff_gray = np.max(diff, axis=2)
-        else:
-            diff_gray = diff
-        
-        # Find regions with very high difference (background)
-        high_diff = diff_gray > 100
-        high_diff_percent = np.sum(high_diff) / high_diff.size
+        _, change_mask = compute_pixel_diff(img1, img2, threshold=100)
+        high_diff_percent = np.sum(change_mask) / change_mask.size
         
         # For overlay: need both high difference AND size difference OR very high difference
         if has_size_diff and high_diff_percent > 0.3:
             return True
-        if high_diff_percent > 0.5:  # Very high difference without size diff
+        if high_diff_percent > 0.5:
             return True
         
         return False
@@ -659,21 +607,14 @@ class TransformDetector:
         img1 = pixel_result['img1']
         img2 = pixel_result['img2']
         
-        # Watermarks: high template correlation but localized pixel changes
-        # Key insight: watermarks are SMALL, localized additions
-        # If SSIM is high (>0.7), it's likely just a filter, not a watermark
         if correlation < 0.5:
             return False, 0.0
         
-        # High SSIM indicates filter, not watermark
         if ssim > 0.7:
             return False, 0.0
         
-        h, w = change_mask.shape
         change_percent = np.sum(change_mask) / change_mask.size
         
-        # If almost all pixels changed, it's NOT a watermark
-        # Watermarks only affect a small portion of the image
         if change_percent > 0.8:
             return False, 0.0
         
@@ -681,22 +622,19 @@ class TransformDetector:
         
         # Method 1: Check for text-like patterns using edge detection
         try:
-            gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY) if len(img1.shape) == 3 else img1
-            gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY) if len(img2.shape) == 3 else img2
+            gray1 = to_grayscale(img1)
+            gray2 = to_grayscale(img2)
             
             # Resize to same dimensions for comparison
             if gray1.shape != gray2.shape:
-                gray2 = cv2.resize(gray2, (gray1.shape[1], gray1.shape[0]))
+                gray2 = resize_to_match(gray2, gray1.shape[:2])
             
-            # Edge detection
             edges1 = cv2.Canny(gray1, 50, 150)
             edges2 = cv2.Canny(gray2, 50, 150)
             
-            # If there are significantly more edges in img2, could be watermark text
             edge_diff = np.sum(edges2) - np.sum(edges1)
             if edge_diff > 0:
                 edge_increase = edge_diff / (np.sum(edges1) + 1)
-                # More strict: need 20%+ edge increase for watermark
                 if edge_increase > 0.2:
                     confidence = max(confidence, 0.6)
                 elif edge_increase > 0.1:
@@ -706,33 +644,20 @@ class TransformDetector:
         
         # Method 2: Check for localized high-contrast regions (typical of watermarks)
         try:
-            if len(img1.shape) == 3:
-                diff = np.abs(img1.astype(np.int32) - img2.astype(np.int32))
-                diff_gray = np.max(diff, axis=2)  # Max difference across channels
-            else:
-                diff_gray = np.abs(img1.astype(np.int32) - img2.astype(np.int32))
-            
-            # Find regions with consistent high difference
-            threshold = 50  # Higher threshold for watermark detection
-            high_diff = (diff_gray > threshold).astype(np.uint8)
+            high_diff_pct, high_diff = compute_pixel_diff(img1, img2, threshold=50)
             
             # Watermarks should affect less than 30% of image
-            high_diff_percent = np.sum(high_diff) / high_diff.size
-            if high_diff_percent > 0.3:
-                # Too much change - not a watermark
+            if high_diff_pct > 30.0:
                 return False, 0.0
             
             # Find connected components
             num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(high_diff, connectivity=8)
             
-            # Watermarks typically have a few large connected regions
             if num_labels > 1:
-                # Get sizes of components (excluding background)
                 sizes = stats[1:, cv2.CC_STAT_AREA]
                 max_size = np.max(sizes) if len(sizes) > 0 else 0
                 total_size = np.sum(sizes)
                 
-                # If there's a dominant region that's not too big or too small
                 if max_size > 100 and max_size < 0.2 * high_diff.size:
                     confidence = max(confidence, 0.7)
                 elif total_size > 0.01 * high_diff.size and total_size < 0.3 * high_diff.size:
@@ -742,17 +667,16 @@ class TransformDetector:
         
         # Method 3: Check corner/edge regions for watermark placement
         try:
-            # Resize change_mask to match img1 dimensions
             if change_mask.shape != img1.shape[:2]:
-                change_mask_resized = cv2.resize(change_mask.astype(np.uint8), 
-                                                  (img1.shape[1], img1.shape[0]))
+                change_mask_resized = resize_to_match(
+                    change_mask.astype(np.uint8), img1.shape[:2]
+                )
             else:
                 change_mask_resized = change_mask
             
             h, w = change_mask_resized.shape
             corner_size = min(h, w) // 4
             
-            # Check corners
             corners = [
                 change_mask_resized[0:corner_size, 0:corner_size],
                 change_mask_resized[0:corner_size, -corner_size:],
@@ -764,14 +688,11 @@ class TransformDetector:
             center = change_mask_resized[corner_size:-corner_size, corner_size:-corner_size]
             center_change = np.mean(center) if center.size > 0 else 0
             
-            # Watermarks often in corners with higher concentration than center
-            # But need significant difference
             if corner_change > 0.6 and corner_change > center_change * 1.5:
                 confidence = max(confidence, 0.65)
         except (cv2.error, ValueError, IndexError):
             pass
         
-        # Higher threshold for watermark detection
         return confidence > 0.55, confidence
 
 
@@ -1040,12 +961,7 @@ class ImageMatcher:
         result.transforms = transforms
         
         # Stage 5: Decision Logic
-        # Calculate size ratio for crop detection
-        orig_shape1 = pixel_result['orig_shape1']
-        orig_shape2 = pixel_result['orig_shape2']
-        area1 = orig_shape1[0] * orig_shape1[1]
-        area2 = orig_shape2[0] * orig_shape2[1]
-        size_ratio = min(area1, area2) / max(area1, area2)
+        size_ratio = compute_size_ratio(pixel_result['orig_shape1'], pixel_result['orig_shape2'])
         is_crop = size_ratio < self.config.crop_size_ratio_threshold
         
         if is_crop:
